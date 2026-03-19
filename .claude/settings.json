@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python sample_data/generate_sample.py)",
+      "Bash(pip3 install:*)",
+      "Bash(python3 sample_data/generate_sample.py)",
+      "Bash(python3 -c \":*)"
+    ]
+  }
+}
