@@ -1218,14 +1218,35 @@ with tab4:
     fig_table = charts.metric_comparison_table(gap_summary)
     st.plotly_chart(fig_table, use_container_width=True)
 
-    revenue_info = gap_summary.get("Revenue", {})
-    if revenue_info.get("has_gap"):
-        revenue_gap = revenue_info["gap"]
+    # Surface every gapped metric — not just Revenue
+    gapped_metrics = [
+        (metric, info)
+        for metric, info in gap_summary.items()
+        if info.get("has_gap")
+    ]
+    if gapped_metrics:
+        gap_lines = " | ".join(
+            f"**{m}**: {format_currency(info['gap'])} ({abs(info.get('gap_pct') or 0):.1f}% variance)"
+            for m, info in gapped_metrics
+        )
         st.error(
-            f"🔴 **Revenue Gap Detected: {format_currency(revenue_gap)}** "
-            f"({abs(revenue_info.get('gap_pct', 0)):.1f}% variance). "
+            f"🔴 **{len(gapped_metrics)} metric(s) have gaps:** {gap_lines}. "
             f"Proceed to AI Investigation to find root causes."
         )
+
+        # Cross-metric inconsistency pre-check — flag derived gaps that don't match components
+        from agents.orchestrator import _detect_cross_metric_inconsistencies
+        cross_issues = _detect_cross_metric_inconsistencies(gap_summary)
+        if cross_issues:
+            for issue in cross_issues:
+                st.warning(
+                    f"⚠️ **Cross-metric inconsistency — {issue['derived_metric']}:** "
+                    f"actual gap {format_currency(issue['actual_gap'])} vs expected "
+                    f"{format_currency(issue['expected_gap'])} from components "
+                    f"({', '.join(f'{k}: {format_currency(v)}' for k, v in issue['components'].items())}). "
+                    f"Unexplained delta: **{format_currency(issue['discrepancy'])}** — "
+                    f"suggests a hidden adjustment or reclassification."
+                )
     else:
         st.success("✅ All metrics reconcile within tolerance. No further investigation needed.")
 
@@ -1457,6 +1478,27 @@ with tab5:
             )
 
         st.divider()
+
+        # Cross-metric inconsistencies — derived metric gaps that exceed component predictions
+        cross_issues = result.get("cross_metric_inconsistencies", [])
+        if cross_issues:
+            st.markdown('<div class="section-header">⚠️ Cross-Metric Inconsistencies Detected</div>', unsafe_allow_html=True)
+            st.caption(
+                "The following derived metric gaps do not match what their component metrics predict. "
+                "This means additional root causes exist beyond the primary attribution above."
+            )
+            for issue in cross_issues:
+                comp_str = " + ".join(
+                    f"{k} (${v:+,.0f})" for k, v in issue["components"].items()
+                )
+                st.warning(
+                    f"**{issue['derived_metric']}** — "
+                    f"actual gap ${issue['actual_gap']:+,.0f} vs expected ${issue['expected_gap']:+,.0f} "
+                    f"from [ {comp_str} ] → "
+                    f"**unexplained delta: ${issue['discrepancy']:+,.0f}**\n\n"
+                    f"{issue['note']}"
+                )
+            st.divider()
 
         with st.expander("📋 Agent Investigation Steps", expanded=False):
             for step in agent_steps:
