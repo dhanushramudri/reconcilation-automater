@@ -9,7 +9,7 @@ from pathlib import Path
 
 AI = {
     "provider": "gemini",
-    "model": os.environ.get("RECON_AI_MODEL", "gemini-2.5-flash"),
+    "model": os.environ.get("RECON_AI_MODEL", "gemini-1.5-flash"),
     "max_tokens": int(os.environ.get("RECON_AI_MAX_TOKENS", "8192")),
     "max_agent_iterations": int(os.environ.get("RECON_MAX_ITERATIONS", "12")),
     "temperature": float(os.environ.get("RECON_AI_TEMPERATURE", "0.1")),

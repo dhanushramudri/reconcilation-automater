@@ -179,6 +179,9 @@ def _build_strategy_prompt(
             f"IMPORTANT: These discrepancies mean the primary metric investigation alone will NOT "
             f"explain all gaps. The ranked_checks must account for the unexplained delta in derived metrics.\n"
         )
+    coverage_pct = coverage.get('coverage_pct') or 100.0
+    unmapped_count = coverage.get('unmapped_count') or 0
+    unmapped_amount = coverage.get('unmapped_amount') or 0.0
 
     prompt = (
         f"You are a senior financial reconciliation analyst.\n\n"
@@ -191,9 +194,9 @@ def _build_strategy_prompt(
         f"{json.dumps(steps_summary, indent=2)}\n\n"
         f"SOURCE SCHEMA (column names + types):\n{json.dumps(src_schema)}\n\n"
         f"TARGET SCHEMA (column names + types):\n{json.dumps(tgt_schema)}\n\n"
-        f"MAPPING COVERAGE: {coverage.get('coverage_pct', 100):.1f}% "
-        f"({coverage.get('unmapped_count', 0)} unmapped transactions, "
-        f"${abs(coverage.get('unmapped_amount', 0)):,.0f})\n\n"
+        f"MAPPING COVERAGE: {coverage_pct:.1f}% "
+        f"({unmapped_count} unmapped transactions, "
+        f"${abs(unmapped_amount):,.0f})\n\n"
         f"Based on the pipeline graph and schema above, return a JSON object with:\n"
         f"  ranked_checks: list of check names in priority order, chosen from:\n"
         f"    ['type1_mapping_gaps', 'type1_ic_eliminations', 'type1_manual_adjustments',\n"
@@ -298,6 +301,16 @@ def _build_narrative_prompt(
     )
 
 
+import re
+
+def _strip_markdown_fences(raw: str) -> str:
+    """Remove ```json ... ``` or ``` ... ``` fences from a model response."""
+    # Remove opening fence (```json or ```)
+    clean = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
+    # Remove closing fence
+    clean = re.sub(r"\s*```$", "", clean.strip())
+    return clean.strip()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Gemini API calls
 # ─────────────────────────────────────────────────────────────────────────────
@@ -360,7 +373,7 @@ def _call_gemini_strategy(api_key: str, prompt: str) -> tuple[dict, int]:
             tokens_used = getattr(usage, "total_token_count", 0) or 0
 
         # Parse JSON — strip any accidental markdown fences
-        clean = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        clean = _strip_markdown_fences(raw)
         strategy = json.loads(clean)
 
         # Validate expected keys — fall back to defaults for any missing key
@@ -398,7 +411,7 @@ def _call_gemini_narrative(api_key: str, prompt: str) -> tuple[str, int]:
                 "Write a concise, professional narrative for a finance director."
             ),
             temperature=AI["temperature"],
-            max_output_tokens=512,
+            max_output_tokens=1024,
         )
         response = client.models.generate_content(
             model=AI["model"],
@@ -519,7 +532,7 @@ def _local_narrative(
                 f"{inc['note']}"
             )
 
-    return " ".join(lines)
+    return "\n\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -742,6 +755,15 @@ def run_recon_agent(
 
     Returns full result dict consumed by streamlit_app.py Tab 5.
     """
+
+    print("input given is", {
+        "fingerprint": fingerprint,
+        "business_context": business_context,
+        "gap_summary": gap_summary,
+        "source": source.shape[0] if not source.empty else 0,
+        "mapping": mapping.shape[0] if not mapping.empty else 0,
+        "target": target.shape[0] if not target.empty else 0
+    })
     api_key = os.environ.get("GEMINI_API_KEY", "")
     primary_metric, primary_gap = _pick_primary_metric(gap_summary)
     pipeline_graph = fingerprint.get("pipeline_graph", {})

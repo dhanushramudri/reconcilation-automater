@@ -22,6 +22,7 @@ import pandas as pd
 import streamlit as st
 from pathlib import Path
 from dotenv import load_dotenv
+import hashlib
 
 load_dotenv()
 
@@ -305,6 +306,132 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
+def find_working_gemini_model(api_key: str) -> str:
+    """
+    Fetches all available Gemini models from the API, filters to those that
+    support generateContent, tests ALL of them, and returns the best working one.
+    Prints a full working/failed summary table.
+    """
+    if not api_key:
+        print("[Model probe] No API key — skipping probe.")
+        return ""
+
+    try:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=api_key)
+    except Exception as exc:
+        print(f"[Model probe] Could not create Gemini client: {exc}")
+        return ""
+
+    # ── Step 1: Fetch all available models ───────────────────────────────────
+    try:
+        all_models = list(client.models.list())
+        print(f"[Model probe] {len(all_models)} models returned by API")
+    except Exception as exc:
+        print(f"[Model probe] Could not list models: {exc}")
+        return ""
+
+    # ── Step 2: Filter to generateContent-capable Gemini models only ─────────
+    candidates = []
+    for m in all_models:
+        name = getattr(m, "name", "") or ""
+        supported = getattr(m, "supported_actions", None) or \
+                    getattr(m, "supported_generation_methods", None) or []
+        if "generateContent" not in supported:
+            continue
+        model_id = name.replace("models/", "")
+        if not model_id.startswith("gemini"):
+            continue
+        candidates.append(model_id)
+
+    print(f"[Model probe] Testing ALL {len(candidates)} generateContent-capable models...\n")
+
+    # ── Step 3: Test ALL candidates, collect results ──────────────────────────
+    import time
+    import re
+
+    working  = []   # list of (model_id, latency_ms)
+    failed   = []   # list of (model_id, error_str)
+
+    for model_id in candidates:
+        try:
+            t0 = time.perf_counter()
+            response = client.models.generate_content(
+                model=model_id,
+                contents=[types.Content(
+                    role="user",
+                    parts=[types.Part(text='Reply with exactly: {"ok": true}')]
+                )],
+                config=types.GenerateContentConfig(
+                    max_output_tokens=20,
+                    temperature=0.0,
+                ),
+            )
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+
+            # Grab the actual text reply for confirmation
+            reply = ""
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, "text") and part.text:
+                    reply += part.text
+            reply = reply.strip()[:40]  # truncate for display
+
+            working.append((model_id, latency_ms, reply))
+            print(f"  ✅ {model_id:<45} {latency_ms:>5} ms   reply: {reply}")
+
+        except Exception as exc:
+            # Extract just the status code + message, not the full traceback
+            err_str = str(exc)
+            short_err = re.search(r"(\d{3} \w+)", err_str)
+            short_err = short_err.group(1) if short_err else err_str[:60]
+            failed.append((model_id, short_err))
+            print(f"  ❌ {model_id:<45}          err: {short_err}")
+
+    # ── Step 4: Print summary table ───────────────────────────────────────────
+    print(f"\n{'─'*70}")
+    print(f"[Model probe] RESULTS — {len(working)} working / {len(failed)} failed")
+    print(f"{'─'*70}")
+
+    if working:
+        print("\n  WORKING MODELS (sorted by latency):")
+        working_sorted = sorted(working, key=lambda x: x[1])  # sort by latency
+        for rank, (model_id, latency_ms, reply) in enumerate(working_sorted, 1):
+            print(f"  {rank:>2}. {model_id:<45} {latency_ms:>5} ms")
+
+        print("\n  FAILED MODELS:")
+        for model_id, err in failed:
+            print(f"      {model_id:<45} {err}")
+
+    # ── Step 5: Pick the best model ───────────────────────────────────────────
+    # Among working models, prefer: stable > preview, flash > pro, newer version
+    def _rank(model_id: str) -> tuple:
+        is_exp = any(x in model_id for x in ("exp", "preview", "tts", "image",
+                                               "computer", "robotics", "customtools"))
+        is_flash = "flash" in model_id
+        version_match = re.search(r"(\d+(?:\.\d+)?)", model_id)
+        version = float(version_match.group(1)) if version_match else 0.0
+        return (int(is_exp), int(not is_flash), -version)
+
+    if not working:
+        print("[Model probe] No working model found.")
+        return ""
+
+    best_model = min(working, key=lambda x: _rank(x[0]))[0]
+    print(f"\n[Model probe] ✅ Best model selected: {best_model}")
+    print(f"{'─'*70}\n")
+
+    # Store full results in a module-level var so callers can inspect if needed
+    find_working_gemini_model.results = {
+        "working": [{"model": m, "latency_ms": l, "reply": r} for m, l, r in working],
+        "failed":  [{"model": m, "error": e}                  for m, e   in failed],
+        "best":    best_model,
+    }
+
+    return best_model
+
+
 # ── Imports (after page config) ───────────────────────────────────────────────
 from core.data_loader import load_source, load_mapping, load_target, load_hierarchy, validate_files, fuzzy_map_accounts
 from core.profiler import build_fingerprint
@@ -349,8 +476,17 @@ with st.sidebar:
         type="password",
         help="Used only for the AI strategy planner (Layer 2). ~600 tokens per investigation.",
     )
-    if api_key:
-        os.environ["GEMINI_API_KEY"] = api_key
+    # After: if api_key: os.environ["GEMINI_API_KEY"] = api_key
+    if api_key and "working_gemini_model" not in st.session_state:
+        with st.spinner("Probing available Gemini models..."):
+            working_model = "gemini-2.5-flash-lite"
+            if working_model:
+                st.session_state["working_gemini_model"] = working_model
+                from config import AI
+                AI["model"] = working_model
+                st.sidebar.success(f"✅ Model: {working_model}")
+            else:
+                st.sidebar.warning("⚠️ No working Gemini model found — AI calls will fall back to default strategy.")
 
     st.divider()
 
@@ -1017,28 +1153,57 @@ with tab2:
     if source_system == "File Upload (Demo)":
         if source_file:
             try:
-                st.session_state["source"] = load_source(source_file)
+                import hashlib
+                file_hash = hashlib.md5(source_file.getvalue()).hexdigest()
+                if st.session_state.get("source_file_hash") != file_hash:
+                    st.session_state["source_file_hash"] = file_hash
+                    st.session_state["source"] = load_source(source_file)
+                    for key in ["our_metrics", "gap_summary", "agent_result",
+                                "fingerprint", "fuzzy_suggestions"]:
+                        st.session_state.pop(key, None)
                 st.success(f"✅ Source loaded: {len(st.session_state['source']):,} rows")
             except Exception as e:
                 st.error(f"Error loading source: {e}")
 
         if mapping_file:
             try:
-                st.session_state["mapping"] = load_mapping(mapping_file)
+                import hashlib
+                file_hash = hashlib.md5(mapping_file.getvalue()).hexdigest()
+                if st.session_state.get("mapping_file_hash") != file_hash:
+                    st.session_state["mapping_file_hash"] = file_hash
+                    st.session_state["mapping"] = load_mapping(mapping_file)
+                    for key in ["our_metrics", "gap_summary", "agent_result", 
+                                "fingerprint", "fuzzy_suggestions",
+                                "metrics_computed_for_hash"]:   # ← add this
+                        st.session_state.pop(key, None)
                 st.success(f"✅ Mapping loaded: {len(st.session_state['mapping']):,} rules")
             except Exception as e:
                 st.error(f"Error loading mapping: {e}")
 
         if target_file:
             try:
-                st.session_state["target"] = load_target(target_file)
+                import hashlib
+                file_hash = hashlib.md5(target_file.getvalue()).hexdigest()
+                if st.session_state.get("target_file_hash") != file_hash:
+                    st.session_state["target_file_hash"] = file_hash
+                    st.session_state["target"] = load_target(target_file)
+                    for key in ["our_metrics", "gap_summary", "agent_result",
+                                "fingerprint", "fuzzy_suggestions"]:
+                        st.session_state.pop(key, None)
                 st.success(f"✅ Target loaded: {len(st.session_state['target']):,} rows")
             except Exception as e:
                 st.error(f"Error loading target: {e}")
 
         if hierarchy_file:
             try:
-                st.session_state["hierarchy"] = load_hierarchy(hierarchy_file)
+                import hashlib
+                file_hash = hashlib.md5(hierarchy_file.getvalue()).hexdigest()
+                if st.session_state.get("hierarchy_file_hash") != file_hash:
+                    st.session_state["hierarchy_file_hash"] = file_hash
+                    st.session_state["hierarchy"] = load_hierarchy(hierarchy_file)
+                    for key in ["our_metrics", "gap_summary", "agent_result",
+                                "fingerprint", "fuzzy_suggestions"]:
+                        st.session_state.pop(key, None)
                 st.success(f"✅ Hierarchy loaded: {len(st.session_state['hierarchy']):,} entities")
             except Exception as e:
                 st.error(f"Error loading hierarchy: {e}")
@@ -1163,6 +1328,17 @@ with tab3:
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab4:
+    # ── TEMPORARY DEBUG — remove after fix confirmed ──
+    st.write("DEBUG source_file_hash:", st.session_state.get("source_file_hash", "NOT SET"))
+    st.write("DEBUG mapping_file_hash:", st.session_state.get("mapping_file_hash", "NOT SET"))
+    st.write("DEBUG target_file_hash:", st.session_state.get("target_file_hash", "NOT SET"))
+    st.write("DEBUG metrics_computed_for_hash:", st.session_state.get("metrics_computed_for_hash", "NOT SET"))
+    st.write("DEBUG our_metrics in session:", "our_metrics" in st.session_state)
+    st.write("DEBUG gap_summary keys:", list(st.session_state.get("gap_summary", {}).keys()))
+    if "gap_summary" in st.session_state:
+        for m, v in st.session_state["gap_summary"].items():
+            st.write(f"  {m}: gap={v.get('gap')}, has_gap={v.get('has_gap')}")
+    # ── END DEBUG ──
     if "source" not in st.session_state or "mapping" not in st.session_state or "target" not in st.session_state:
         st.info("📤 Upload all required files first (Source + Mapping + Target).")
         st.stop()
@@ -1174,13 +1350,32 @@ with tab4:
 
     st.markdown('<div class="section-header">Headline Metric Comparison</div>', unsafe_allow_html=True)
 
-    if "our_metrics" not in st.session_state:
-        with st.spinner("Computing metrics (Layer 4 — Type 2 data checks)..."):
+    # Recompute if mapping, source, or target changed (use combined hash as cache key)
+    current_data_hash = (
+        st.session_state.get("source_file_hash", "src") +
+        st.session_state.get("mapping_file_hash", "map") +
+        st.session_state.get("target_file_hash", "tgt")
+    )
+    if (
+        "our_metrics" not in st.session_state
+        or st.session_state.get("metrics_computed_for_hash") != current_data_hash
+    ):
+        with st.spinner("Computing metrics..."):
             result = compute_our_metrics(source, mapping, hierarchy)
             st.session_state["our_metrics"] = result
             target_metrics = parse_target_metrics(target)
             gap_summary = compute_gap_summary(result["by_metric"], target_metrics)
             st.session_state["gap_summary"] = gap_summary
+            st.session_state["metrics_computed_for_hash"] = current_data_hash
+
+        # ── TEMPORARY DEBUG ──
+        st.write("DEBUG by_metric keys:", list(result.get("by_metric", {}).keys()))
+        st.write("DEBUG by_metric values:", {k: round(v, 0) for k, v in result.get("by_metric", {}).items()})
+        st.write("DEBUG target_metrics:", target_metrics)
+        st.write("DEBUG gap_summary computed:", {m: {"gap": v.get("gap"), "has_gap": v.get("has_gap")} for m, v in gap_summary.items()})
+        st.write("DEBUG mapping shape:", mapping.shape)
+        st.write("DEBUG mapping columns:", list(mapping.columns))
+        st.write("DEBUG mapping head:", mapping.head(3).to_dict())
 
     our_metrics = st.session_state["our_metrics"]
     gap_summary = st.session_state["gap_summary"]
@@ -1345,6 +1540,7 @@ with tab5:
 
             with st.spinner("ReconAgent is investigating..."):
                 try:
+                   
                     result = run_recon_agent(
                         fingerprint=fingerprint,
                         business_context=business_context,
@@ -1461,6 +1657,7 @@ with tab5:
             st.markdown('<div class="section-header">AI Analysis Narrative</div>', unsafe_allow_html=True)
             ai_used = result.get("ai_used", False)
             tokens = result.get("tokens_used", 0)
+
             if ai_used:
                 st.markdown(
                     f'<span class="ai-call-badge">🤖 Layer 2 / Layer 5 AI narrative · {tokens:,} tokens used</span>',
@@ -1468,15 +1665,39 @@ with tab5:
                 )
             else:
                 st.markdown(
-                    '<span class="ai-call-badge">🐍 Local rule-based narrative · 0 API tokens used</span>',
+                    '<span class="ai-call-badge"> Local rule-based narrative · 0 API tokens used</span>',
                     unsafe_allow_html=True,
                 )
+
+            # st.info() renders markdown natively — bold, bullets, etc. all work
+            # Replace $ with unicode dollar sign to avoid LaTeX rendering
+            safe_narrative = narrative.replace("$", "&#36;").replace("\\$", "&#36;")
+            # Use a custom CSS class via markdown for the blue left border style
+            st.markdown("""
+                <style>
+                .narrative-box {
+                    background: #F7FAFC;
+                    border-left: 4px solid #2E86C1;
+                    padding: 1rem 1.5rem;
+                    border-radius: 4px;
+                    font-size: 0.95rem;
+                    line-height: 1.8;
+                    color: #2D3748;
+                    margin: 0.5rem 0 1rem 0;
+                }
+                </style>
+            """, unsafe_allow_html=True)
+
+            # Convert **bold** markdown to <strong> HTML tags for safe rendering
+            import re
+            html_narrative = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', safe_narrative)
+            # Convert line breaks
+            html_narrative = html_narrative.replace("\n", "<br>")
+
             st.markdown(
-                f'<div style="background:#F7FAFC;border-left:4px solid #2E86C1;padding:1rem 1.5rem;'
-                f'border-radius:4px;font-size:0.95rem;line-height:1.7">{narrative}</div>',
+                f'<div class="narrative-box">{html_narrative}</div>',
                 unsafe_allow_html=True,
             )
-
         st.divider()
 
         # Cross-metric inconsistencies — derived metric gaps that exceed component predictions
@@ -1489,14 +1710,15 @@ with tab5:
             )
             for issue in cross_issues:
                 comp_str = " + ".join(
-                    f"{k} (${v:+,.0f})" for k, v in issue["components"].items()
+                    f"{k} (&#36;{v:+,.0f})" for k, v in issue["components"].items()
                 )
+                note_safe = issue['note'].replace('$', '&#36;')
                 st.warning(
                     f"**{issue['derived_metric']}** — "
-                    f"actual gap ${issue['actual_gap']:+,.0f} vs expected ${issue['expected_gap']:+,.0f} "
+                    f"actual gap &#36;{issue['actual_gap']:+,.0f} vs expected &#36;{issue['expected_gap']:+,.0f} "
                     f"from [ {comp_str} ] → "
-                    f"**unexplained delta: ${issue['discrepancy']:+,.0f}**\n\n"
-                    f"{issue['note']}"
+                    f"**unexplained delta: &#36;{issue['discrepancy']:+,.0f}**\n\n"
+                    f"{note_safe}"
                 )
             st.divider()
 
@@ -1707,7 +1929,7 @@ with tab6:
             ai_usage={
                 "ai_used": agent_result.get("ai_used", False),
                 "tokens_used": agent_result.get("tokens_used", 0),
-                "model": "gemini-2.5-flash",
+                "model": "gemini-1.5-flash",
             },
         )
         st.download_button(
