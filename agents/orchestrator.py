@@ -347,6 +347,7 @@ def _call_gemini_strategy(api_key: str, prompt: str) -> tuple[dict, int]:
             contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
             config=config,
         )
+        print("raw response:", response)
 
         raw = ""
         for part in response.candidates[0].content.parts:
@@ -370,8 +371,11 @@ def _call_gemini_strategy(api_key: str, prompt: str) -> tuple[dict, int]:
         return strategy, int(tokens_used)
 
     except Exception as exc:
-        default_strategy["reasoning"] = f"AI strategy planner error: {exc}"
-        return default_strategy, 0
+            import traceback
+            print(f"[Gemini strategy error] {exc}")
+            traceback.print_exc()
+            default_strategy["reasoning"] = f"AI strategy planner error: {exc}"
+            return default_strategy, 0
 
 
 def _call_gemini_narrative(api_key: str, prompt: str) -> tuple[str, int]:
